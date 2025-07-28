@@ -90,12 +90,17 @@
               <artifactSet>
                 <includes>
                   <include>org.codehaus.janino</include>
+                  <include>com.google.guava:*</include>
                 </includes>
               </artifactSet>
               <relocations>
                 <relocation>
                   <pattern>org.codehaus</pattern>
                   <shadedPattern>org.apache.fory.shaded.org.codehaus</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>com.google.common</pattern>
+                  <shadedPattern>org.apache.fory.shaded.com.google.common</shadedPattern>
                 </relocation>
               </relocations>
               <filters>
