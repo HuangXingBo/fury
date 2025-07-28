@@ -30,7 +30,6 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import org.apache.fory.Fory;
@@ -59,6 +58,7 @@ import org.apache.fory.util.unsafe._JDKAccess;
 public final class StringSerializer extends ImmutableSerializer<String> {
   private static final boolean STRING_VALUE_FIELD_IS_CHARS;
   private static final boolean STRING_VALUE_FIELD_IS_BYTES;
+  private static final boolean STRING_VALUE_COMPACT_ENABLED;
 
   private static final byte LATIN1 = 0;
   private static final Byte LATIN1_BOXED = LATIN1;
@@ -104,6 +104,14 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     Preconditions.checkArgument(
         ReflectionUtils.getFieldNullable(String.class, "offset") == null,
         "Current jdk not supported");
+
+    if (STRING_VALUE_FIELD_IS_BYTES) {
+      String detectionString = "fury";
+      final byte coder = Platform.getByte(detectionString, Offset.STRING_CODER_FIELD_OFFSET);
+      STRING_VALUE_COMPACT_ENABLED = coder == LATIN1;
+    } else {
+      STRING_VALUE_COMPACT_ENABLED = false;
+    }
   }
 
   private final boolean compressString;
@@ -127,7 +135,7 @@ public final class StringSerializer extends ImmutableSerializer<String> {
 
   @Override
   public void xwrite(MemoryBuffer buffer, String value) {
-    writeJavaString(buffer, value);
+    writeUTF8String(buffer, value);
   }
 
   @Override
@@ -137,52 +145,64 @@ public final class StringSerializer extends ImmutableSerializer<String> {
 
   @Override
   public String xread(MemoryBuffer buffer) {
-    return readJavaString(buffer);
+    return readUTF8String(buffer);
   }
 
   public void writeString(MemoryBuffer buffer, String value) {
-    writeJavaString(buffer, value);
+    if (isJava) {
+      writeJavaString(buffer, value);
+    } else {
+      writeUTF8String(buffer, value);
+    }
   }
 
   public Expression writeStringExpr(Expression strSerializer, Expression buffer, Expression str) {
-    if (STRING_VALUE_FIELD_IS_BYTES) {
-      if (compressString) {
-        return new Invoke(strSerializer, "writeCompressedBytesString", buffer, str);
+    if (isJava) {
+      if (STRING_VALUE_FIELD_IS_BYTES) {
+        if (compressString) {
+          return new Invoke(strSerializer, "writeCompressedBytesString", buffer, str);
+        } else {
+          return new StaticInvoke(StringSerializer.class, "writeBytesString", buffer, str);
+        }
       } else {
-        return new StaticInvoke(StringSerializer.class, "writeBytesString", buffer, str);
+        if (!STRING_VALUE_FIELD_IS_CHARS) {
+          throw new UnsupportedOperationException();
+        }
+        if (compressString) {
+          return new Invoke(strSerializer, "writeCompressedCharsString", buffer, str);
+        } else {
+          return new Invoke(strSerializer, "writeCharsString", buffer, str);
+        }
       }
     } else {
-      if (!STRING_VALUE_FIELD_IS_CHARS) {
-        throw new UnsupportedOperationException();
-      }
-      if (compressString) {
-        return new Invoke(strSerializer, "writeCompressedCharsString", buffer, str);
-      } else {
-        return new Invoke(strSerializer, "writeCharsString", buffer, str);
-      }
+      return new Invoke(strSerializer, "writeUTF8String", buffer, str);
     }
   }
 
   public String readString(MemoryBuffer buffer) {
-    return readJavaString(buffer);
+    if (isJava) {
+      return readJavaString(buffer);
+    } else {
+      return readUTF8String(buffer);
+    }
   }
 
   public Expression readStringExpr(Expression strSerializer, Expression buffer) {
-    if (STRING_VALUE_FIELD_IS_BYTES) {
-      if (compressString) {
-        return new Invoke(strSerializer, "readCompressedBytesString", STRING_TYPE, buffer);
-      } else {
+    if (isJava) {
+      if (STRING_VALUE_FIELD_IS_BYTES) {
         return new Invoke(strSerializer, "readBytesString", STRING_TYPE, buffer);
+      } else {
+        if (!STRING_VALUE_FIELD_IS_CHARS) {
+          throw new UnsupportedOperationException();
+        }
+        if (compressString) {
+          return new Invoke(strSerializer, "readCompressedCharsString", STRING_TYPE, buffer);
+        } else {
+          return new Invoke(strSerializer, "readCharsString", STRING_TYPE, buffer);
+        }
       }
     } else {
-      if (!STRING_VALUE_FIELD_IS_CHARS) {
-        throw new UnsupportedOperationException();
-      }
-      if (compressString) {
-        return new Invoke(strSerializer, "readCompressedCharsString", STRING_TYPE, buffer);
-      } else {
-        return new Invoke(strSerializer, "readCharsString", STRING_TYPE, buffer);
-      }
+      return new Invoke(strSerializer, "readUTF8String", STRING_TYPE, buffer);
     }
   }
 
@@ -191,11 +211,15 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     long header = buffer.readVarUint36Small();
     byte coder = (byte) (header & 0b11);
     int numBytes = (int) (header >>> 2);
-    byte[] bytes = readBytesUnCompressedUTF16(buffer, numBytes);
-    if (coder != UTF8) {
-      return newBytesStringZeroCopy(coder, bytes);
+    if (STRING_VALUE_FIELD_IS_BYTES && !STRING_VALUE_COMPACT_ENABLED && coder == LATIN1) {
+      return newBytesStringZeroCopy(UTF16, readUTF16BytesFromLatin1(buffer, numBytes));
     } else {
-      return new String(bytes, 0, numBytes, StandardCharsets.UTF_8);
+      byte[] bytes = readBytesUnCompressedUTF16(buffer, numBytes);
+      if (coder != UTF8) {
+        return newBytesStringZeroCopy(coder, bytes);
+      } else {
+        return new String(bytes, 0, numBytes, StandardCharsets.UTF_8);
+      }
     }
   }
 
@@ -221,15 +245,13 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     byte coder = (byte) (header & 0b11);
     int numBytes = (int) (header >>> 2);
     if (coder == UTF8) {
-      byte[] data;
-      if (writeNumUtf16BytesForUtf8Encoding) {
-        data = readBytesUTF8PerfOptimized(buffer, numBytes);
-      } else {
-        data = readBytesUTF8(buffer, numBytes);
-      }
-      return newBytesStringZeroCopy(UTF16, data);
+      return newBytesStringZeroCopy(UTF16, readBytesUTF8(buffer, numBytes));
     } else if (coder == LATIN1 || coder == UTF16) {
-      return newBytesStringZeroCopy(coder, readBytesUnCompressedUTF16(buffer, numBytes));
+      if (STRING_VALUE_COMPACT_ENABLED || coder == UTF16) {
+        return newBytesStringZeroCopy(coder, readBytesUnCompressedUTF16(buffer, numBytes));
+      } else {
+        return newBytesStringZeroCopy(UTF16, readUTF16BytesFromLatin1(buffer, numBytes));
+      }
     } else {
       throw new RuntimeException("Unknown coder type " + coder);
     }
@@ -244,9 +266,7 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     if (coder == LATIN1) {
       chars = readCharsLatin1(buffer, numBytes);
     } else if (coder == UTF8) {
-      return writeNumUtf16BytesForUtf8Encoding
-          ? readCharsUTF8PerfOptimized(buffer, numBytes)
-          : readCharsUTF8(buffer, numBytes);
+      chars = readCharsUTF8(buffer, numBytes);
     } else if (coder == UTF16) {
       chars = readCharsUTF16(buffer, numBytes);
     } else {
@@ -255,7 +275,7 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     return newCharsStringZeroCopy(chars);
   }
 
-  // Invoked by fory JIT
+  // Invoked by fury JIT
   public void writeJavaString(MemoryBuffer buffer, String value) {
     if (STRING_VALUE_FIELD_IS_BYTES) {
       if (compressString) {
@@ -273,7 +293,14 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     }
   }
 
-  // Invoked by fory JIT
+  @CodegenInvoke
+  public void writeUTF8String(MemoryBuffer buffer, String value) {
+    byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+    buffer.writeVarUint32(bytes.length);
+    buffer.writeBytes(bytes);
+  }
+
+  // Invoked by fury JIT
   public String readJavaString(MemoryBuffer buffer) {
     if (STRING_VALUE_FIELD_IS_BYTES) {
       if (compressString) {
@@ -294,14 +321,20 @@ public final class StringSerializer extends ImmutableSerializer<String> {
   @CodegenInvoke
   public void writeCompressedBytesString(MemoryBuffer buffer, String value) {
     final byte[] bytes = (byte[]) Platform.getObject(value, STRING_VALUE_FIELD_OFFSET);
-    final byte coder = Platform.getByte(value, Offset.STRING_CODER_FIELD_OFFSET);
-    if (coder == LATIN1 || bestCoder(bytes) == UTF16) {
-      writeBytesString(buffer, coder, bytes);
-    } else {
-      if (writeNumUtf16BytesForUtf8Encoding) {
-        writeBytesUTF8PerfOptimized(buffer, bytes);
+    if (STRING_VALUE_COMPACT_ENABLED) {
+      final byte coder = Platform.getByte(value, Offset.STRING_CODER_FIELD_OFFSET);
+      if (coder == LATIN1 || bestCoder(bytes) == UTF16) {
+        writeBytesString(buffer, coder, bytes);
       } else {
         writeBytesUTF8(buffer, bytes);
+      }
+    } else {
+      if (StringUtils.isLatin(bytes)) {
+        writeUTF16BytesLatin1(buffer, bytes);
+      } else if (bestCoder(bytes) == UTF8) {
+        writeBytesUTF8(buffer, bytes);
+      } else {
+        writeBytesString(buffer, UTF16, bytes);
       }
     }
   }
@@ -313,11 +346,7 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     if (coder == LATIN1) {
       writeCharsLatin1(buffer, chars, chars.length);
     } else if (coder == UTF8) {
-      if (writeNumUtf16BytesForUtf8Encoding) {
-        writeCharsUTF8PerfOptimized(buffer, chars);
-      } else {
-        writeCharsUTF8(buffer, chars);
-      }
+      writeCharsUTF8(buffer, chars);
     } else {
       writeCharsUTF16(buffer, chars, chars.length);
     }
@@ -366,6 +395,24 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     }
   }
 
+  @CodegenInvoke
+  public String readUTF8String(MemoryBuffer buffer) {
+    int numBytes = buffer.readVarUint32Small14();
+    buffer.checkReadableBytes(numBytes);
+    final byte[] targetArray = buffer.getHeapMemory();
+    if (targetArray != null) {
+      String str =
+          new String(
+              targetArray, buffer._unsafeHeapReaderIndex(), numBytes, StandardCharsets.UTF_8);
+      buffer.increaseReaderIndex(numBytes);
+      return str;
+    } else {
+      final byte[] tmpArray = getByteArray(numBytes);
+      buffer.readBytes(tmpArray, 0, numBytes);
+      return new String(tmpArray, 0, numBytes, StandardCharsets.UTF_8);
+    }
+  }
+
   public char[] readCharsLatin1(MemoryBuffer buffer, int numBytes) {
     buffer.checkReadableBytes(numBytes);
     byte[] srcArray = buffer.getHeapMemory();
@@ -377,64 +424,82 @@ public final class StringSerializer extends ImmutableSerializer<String> {
       }
       buffer._increaseReaderIndexUnsafe(numBytes);
     } else {
-      byte[] tmpArray = getByteArray(numBytes);
-      buffer.readBytes(tmpArray, 0, numBytes);
+      long address = buffer.getUnsafeReaderAddress();
       for (int i = 0; i < numBytes; i++) {
-        chars[i] = (char) (tmpArray[i] & 0xff);
+        chars[i] = (char) (Platform.UNSAFE.getByte(null, address + i) & 0xff);
       }
+      buffer._increaseReaderIndexUnsafe(numBytes);
     }
     return chars;
   }
 
   public byte[] readBytesUTF8(MemoryBuffer buffer, int numBytes) {
-    byte[] tmpArray = getByteArray(numBytes << 1);
-    buffer.checkReadableBytes(numBytes);
-    int utf16NumBytes;
-    byte[] srcArray = buffer.getHeapMemory();
-    if (srcArray != null) {
-      int srcIndex = buffer._unsafeHeapReaderIndex();
-      utf16NumBytes =
-          StringEncodingUtils.convertUTF8ToUTF16(srcArray, srcIndex, numBytes, tmpArray);
-      buffer._increaseReaderIndexUnsafe(numBytes);
-    } else {
-      byte[] byteArray2 = getByteArray2(numBytes);
-      buffer.readBytes(byteArray2, 0, numBytes);
-      utf16NumBytes = StringEncodingUtils.convertUTF8ToUTF16(byteArray2, 0, numBytes, tmpArray);
-    }
-    return Arrays.copyOf(tmpArray, utf16NumBytes);
-  }
-
-  private byte[] readBytesUTF8PerfOptimized(MemoryBuffer buffer, int numBytes) {
     int udf8Bytes = buffer.readInt32();
     byte[] bytes = new byte[numBytes];
-    // noinspection Duplicates
     buffer.checkReadableBytes(udf8Bytes);
     byte[] srcArray = buffer.getHeapMemory();
     if (srcArray != null) {
       int srcIndex = buffer._unsafeHeapReaderIndex();
       int readLen = StringEncodingUtils.convertUTF8ToUTF16(srcArray, srcIndex, udf8Bytes, bytes);
-      assert readLen == numBytes : "Decode UTF8 to UTF16 failed";
+      if (readLen != numBytes) {
+        throw new RuntimeException("Decode UTF8 to UTF16 failed");
+      }
       buffer._increaseReaderIndexUnsafe(udf8Bytes);
     } else {
-      byte[] tmpArray = getByteArray(udf8Bytes);
-      buffer.readBytes(tmpArray, 0, udf8Bytes);
-      int readLen = StringEncodingUtils.convertUTF8ToUTF16(tmpArray, 0, udf8Bytes, bytes);
-      assert readLen == numBytes : "Decode UTF8 to UTF16 failed";
+      long address = buffer.getUnsafeReaderAddress();
+      int readLen = StringEncodingUtils.convertUTF8ToUTF16(address, bytes, udf8Bytes);
+      if (readLen != numBytes) {
+        throw new RuntimeException("Decode UTF8 to UTF16 failed");
+      }
+      buffer._increaseReaderIndexUnsafe(udf8Bytes);
     }
     return bytes;
   }
 
   public byte[] readBytesUnCompressedUTF16(MemoryBuffer buffer, int numBytes) {
     buffer.checkReadableBytes(numBytes);
-    byte[] bytes;
+    byte[] bytes = new byte[numBytes];
     byte[] heapMemory = buffer.getHeapMemory();
     if (heapMemory != null) {
       final int arrIndex = buffer._unsafeHeapReaderIndex();
       buffer.increaseReaderIndex(numBytes);
-      bytes = new byte[numBytes];
       System.arraycopy(heapMemory, arrIndex, bytes, 0, numBytes);
     } else {
-      bytes = buffer.readBytes(numBytes);
+      long address = buffer.getUnsafeReaderAddress();
+      Platform.UNSAFE.copyMemory(null, address, bytes, Platform.BYTE_ARRAY_OFFSET, numBytes);
+      buffer.increaseReaderIndex(numBytes);
+    }
+    return bytes;
+  }
+
+  public byte[] readUTF16BytesFromLatin1(MemoryBuffer buffer, int numBytes) {
+    buffer.checkReadableBytes(numBytes);
+    byte[] bytes = new byte[numBytes * 2];
+    byte[] heapMemory = buffer.getHeapMemory();
+    if (heapMemory != null) {
+      final int arrIndex = buffer._unsafeHeapReaderIndex();
+      buffer.increaseReaderIndex(numBytes);
+      if (Platform.IS_LITTLE_ENDIAN) {
+        for (int i = arrIndex, j = 0; i < arrIndex + numBytes; i++, j += 2) {
+          bytes[j] = (byte) (heapMemory[i] & 0xff);
+        }
+      } else {
+        for (int i = arrIndex, j = 1; i < arrIndex + numBytes; i++, j += 2) {
+          bytes[j] = (byte) (heapMemory[i] & 0xff);
+        }
+      }
+    } else {
+      long address = buffer.getUnsafeReaderAddress();
+      if (Platform.IS_LITTLE_ENDIAN) {
+        for (int i = 0; i < numBytes; i++) {
+          bytes[i * 2] = (byte) (Platform.UNSAFE.getByte(null, address + i) & 0xff);
+        }
+      } else {
+        for (int i = 0; i < numBytes; i++) {
+          bytes[i * 2 + 1] = (byte) (Platform.UNSAFE.getByte(null, address + i) & 0xff);
+        }
+      }
+      buffer.increaseReaderIndex(numBytes);
     }
     return bytes;
   }
@@ -458,57 +523,45 @@ public final class StringSerializer extends ImmutableSerializer<String> {
         }
         buffer._increaseReaderIndexUnsafe(numBytes);
       } else {
-        final byte[] tmpArray = getByteArray(numBytes);
-        buffer.readBytes(tmpArray, 0, numBytes);
+        long address = buffer.getUnsafeReaderAddress();
         int charIndex = 0;
         for (int i = 0; i < numBytes; i += 2) {
           char c =
               (char)
-                  ((tmpArray[i] & 0xff << StringUTF16.HI_BYTE_SHIFT)
-                      | ((tmpArray[i + 1] & 0xff) << StringUTF16.LO_BYTE_SHIFT));
+                  (((Platform.UNSAFE.getByte(null, address + i) & 0xff)
+                          << StringUTF16.HI_BYTE_SHIFT)
+                      | ((Platform.UNSAFE.getByte(null, address + i + 1) & 0xff)
+                          << StringUTF16.LO_BYTE_SHIFT));
           chars[charIndex++] = c;
         }
+        buffer._increaseReaderIndexUnsafe(numBytes);
       }
     }
     return chars;
   }
 
-  public String readCharsUTF8(MemoryBuffer buffer, int numBytes) {
-    char[] chars = getCharArray(numBytes);
-    int charsLen;
-    buffer.checkReadableBytes(numBytes);
-    byte[] srcArray = buffer.getHeapMemory();
-    if (srcArray != null) {
-      int srcIndex = buffer._unsafeHeapReaderIndex();
-      charsLen = StringEncodingUtils.convertUTF8ToUTF16(srcArray, srcIndex, numBytes, chars);
-      buffer._increaseReaderIndexUnsafe(numBytes);
-    } else {
-      byte[] tmpArray = getByteArray(numBytes);
-      buffer.readBytes(tmpArray, 0, numBytes);
-      charsLen = StringEncodingUtils.convertUTF8ToUTF16(tmpArray, 0, numBytes, chars);
-    }
-    return new String(chars, 0, charsLen);
-  }
-
-  public String readCharsUTF8PerfOptimized(MemoryBuffer buffer, int numBytes) {
+  public char[] readCharsUTF8(MemoryBuffer buffer, int numBytes) {
     int udf16Chars = numBytes >> 1;
     int udf8Bytes = buffer.readInt32();
     char[] chars = new char[udf16Chars];
-    // noinspection Duplicates
     buffer.checkReadableBytes(udf8Bytes);
     byte[] srcArray = buffer.getHeapMemory();
     if (srcArray != null) {
       int srcIndex = buffer._unsafeHeapReaderIndex();
       int readLen = StringEncodingUtils.convertUTF8ToUTF16(srcArray, srcIndex, udf8Bytes, chars);
-      assert readLen == udf16Chars : "Decode UTF8 to UTF16 failed";
+      if (readLen != udf16Chars) {
+        throw new RuntimeException("Decode UTF8 to UTF16 failed");
+      }
       buffer._increaseReaderIndexUnsafe(udf8Bytes);
     } else {
-      byte[] tmpArray = getByteArray(udf8Bytes);
-      buffer.readBytes(tmpArray, 0, udf8Bytes);
-      int readLen = StringEncodingUtils.convertUTF8ToUTF16(tmpArray, 0, udf8Bytes, chars);
-      assert readLen == udf16Chars : "Decode UTF8 to UTF16 failed";
+      long address = buffer.getUnsafeReaderAddress();
+      int readLen = StringEncodingUtils.convertUTF8ToUTF16(address, chars, udf8Bytes);
+      if (readLen != udf16Chars) {
+        throw new RuntimeException("Decode UTF8 to UTF16 failed");
+      }
+      buffer._increaseReaderIndexUnsafe(udf8Bytes);
     }
-    return newCharsStringZeroCopy(chars);
+    return chars;
   }
 
   public void writeCharsLatin1(MemoryBuffer buffer, char[] chars, int numBytes) {
@@ -526,11 +579,10 @@ public final class StringSerializer extends ImmutableSerializer<String> {
       }
     } else {
       writerIndex += buffer._unsafePutVarUint36Small(writerIndex, header);
-      final byte[] tmpArray = getByteArray(numBytes);
+      long address = buffer.getUnsafeAddress() + writerIndex;
       for (int i = 0; i < numBytes; i++) {
-        tmpArray[i] = (byte) chars[i];
+        Platform.UNSAFE.putByte(null, address + i, (byte) chars[i]);
       }
-      buffer.put(writerIndex, tmpArray, 0, numBytes);
     }
     writerIndex += numBytes;
     buffer._unsafeWriterIndex(writerIndex);
@@ -567,50 +619,7 @@ public final class StringSerializer extends ImmutableSerializer<String> {
 
   public void writeCharsUTF8(MemoryBuffer buffer, char[] chars) {
     int estimateMaxBytes = chars.length * 3;
-    // num bytes of utf8 should be smaller than utf16, otherwise we should
-    // utf16 instead.
-    // We can't use length in header since we don't know num chars in go/c++
-    int approxNumBytes = (int) (chars.length * 1.5) + 1;
-    int writerIndex = buffer.writerIndex();
-    // 9 for max bytes of header
-    buffer.ensure(writerIndex + 9 + estimateMaxBytes);
-    byte[] targetArray = buffer.getHeapMemory();
-    if (targetArray != null) {
-      // noinspection Duplicates
-      int targetIndex = buffer._unsafeHeapWriterIndex();
-      // keep this index in case actual num utf8 bytes need different bytes for header
-      int headerPos = targetIndex;
-      int arrIndex = targetIndex;
-      long header = ((long) approxNumBytes << 2) | UTF8;
-      int headerBytesWritten = LittleEndian.putVarUint36Small(targetArray, arrIndex, header);
-      arrIndex += headerBytesWritten;
-      writerIndex += headerBytesWritten;
-      // noinspection Duplicates
-      targetIndex = StringEncodingUtils.convertUTF16ToUTF8(chars, targetArray, arrIndex);
-      byte stashedByte = targetArray[arrIndex];
-      int written = targetIndex - arrIndex;
-      header = ((long) written << 2) | UTF8;
-      int diff =
-          LittleEndian.putVarUint36Small(targetArray, headerPos, header) - headerBytesWritten;
-      if (diff != 0) {
-        handleWriteCharsUTF8UnalignedHeaderBytes(targetArray, arrIndex, diff, written, stashedByte);
-      }
-      buffer._unsafeWriterIndex(writerIndex + written + diff);
-    } else {
-      // noinspection Duplicates
-      final byte[] tmpArray = getByteArray(estimateMaxBytes);
-      int written = StringEncodingUtils.convertUTF16ToUTF8(chars, tmpArray, 0);
-      long header = ((long) written << 2) | UTF8;
-      writerIndex += buffer._unsafePutVarUint36Small(writerIndex, header);
-      buffer.put(writerIndex, tmpArray, 0, written);
-      buffer._unsafeWriterIndex(writerIndex + written);
-    }
-  }
-
-  public void writeCharsUTF8PerfOptimized(MemoryBuffer buffer, char[] chars) {
-    int estimateMaxBytes = chars.length * 3;
     int numBytes = MathUtils.doubleExact(chars.length);
-    // noinspection Duplicates
     int writerIndex = buffer.writerIndex();
     long header = ((long) numBytes << 2) | UTF8;
     buffer.ensure(writerIndex + 9 + estimateMaxBytes);
@@ -625,65 +634,15 @@ public final class StringSerializer extends ImmutableSerializer<String> {
       buffer._unsafePutInt32(writerIndex, written);
       buffer._unsafeWriterIndex(writerIndex + 4 + written);
     } else {
-      final byte[] tmpArray = getByteArray(estimateMaxBytes);
-      int written = StringEncodingUtils.convertUTF16ToUTF8(chars, tmpArray, 0);
       writerIndex += buffer._unsafePutVarUint36Small(writerIndex, header);
+      long offHeapAddress = buffer.getUnsafeAddress();
+      int written = StringEncodingUtils.convertUTF16ToUTF8(chars, offHeapAddress + writerIndex + 4);
       buffer._unsafePutInt32(writerIndex, written);
-      writerIndex += 4;
-      buffer.put(writerIndex, tmpArray, 0, written);
-      buffer._unsafeWriterIndex(writerIndex + written);
+      buffer._unsafeWriterIndex(writerIndex + written + 4);
     }
   }
 
-  private void handleWriteCharsUTF8UnalignedHeaderBytes(
-      byte[] targetArray, int arrIndex, int diff, int written, byte stashed) {
-    if (diff == 1) {
-      System.arraycopy(targetArray, arrIndex + 1, targetArray, arrIndex + 2, written - 1);
-      targetArray[arrIndex + 1] = stashed;
-    } else {
-      System.arraycopy(targetArray, arrIndex, targetArray, arrIndex - 1, written);
-    }
-  }
-
-  private void writeBytesUTF8(MemoryBuffer buffer, byte[] bytes) {
-    int numBytes = bytes.length;
-    int estimateMaxBytes = bytes.length / 2 * 3;
-    int writerIndex = buffer.writerIndex();
-    buffer.ensure(writerIndex + 9 + estimateMaxBytes);
-    byte[] targetArray = buffer.getHeapMemory();
-    if (targetArray != null) {
-      // noinspection Duplicates
-      int targetIndex = buffer._unsafeHeapWriterIndex();
-      // keep this index in case actual num utf8 bytes need different bytes for header
-      int headerPos = targetIndex;
-      int arrIndex = targetIndex;
-      long header = ((long) numBytes << 2) | UTF8;
-      int headerBytesWritten = LittleEndian.putVarUint36Small(targetArray, arrIndex, header);
-      arrIndex += headerBytesWritten;
-      writerIndex += arrIndex - targetIndex;
-      // noinspection Duplicates
-      targetIndex = StringEncodingUtils.convertUTF16ToUTF8(bytes, targetArray, arrIndex);
-      byte stashedByte = targetArray[arrIndex];
-      int written = targetIndex - arrIndex;
-      header = ((long) written << 2) | UTF8;
-      int diff =
-          LittleEndian.putVarUint36Small(targetArray, headerPos, header) - headerBytesWritten;
-      if (diff != 0) {
-        handleWriteCharsUTF8UnalignedHeaderBytes(targetArray, arrIndex, diff, written, stashedByte);
-      }
-      buffer._unsafeWriterIndex(writerIndex + written + diff);
-    } else {
-      // noinspection Duplicates
-      final byte[] tmpArray = getByteArray(estimateMaxBytes);
-      int written = StringEncodingUtils.convertUTF16ToUTF8(bytes, tmpArray, 0);
-      long header = ((long) written << 2) | UTF8;
-      writerIndex += buffer._unsafePutVarUint36Small(writerIndex, header);
-      buffer.put(writerIndex, tmpArray, 0, written);
-      buffer._unsafeWriterIndex(writerIndex + written);
-    }
-  }
-
-  private void writeBytesUTF8PerfOptimized(MemoryBuffer buffer, byte[] bytes) {
+  public void writeBytesUTF8(MemoryBuffer buffer, byte[] bytes) {
     int numBytes = bytes.length;
     int estimateMaxBytes = bytes.length / 2 * 3;
     int writerIndex = buffer.writerIndex();
@@ -691,6 +650,7 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     buffer.ensure(writerIndex + 9 + estimateMaxBytes);
     byte[] targetArray = buffer.getHeapMemory();
     if (targetArray != null) {
+      // noinspection Duplicates
       int targetIndex = buffer._unsafeHeapWriterIndex();
       int arrIndex = targetIndex;
       arrIndex += LittleEndian.putVarUint36Small(targetArray, arrIndex, header);
@@ -700,14 +660,49 @@ public final class StringSerializer extends ImmutableSerializer<String> {
       buffer._unsafePutInt32(writerIndex, written);
       buffer._unsafeWriterIndex(writerIndex + 4 + written);
     } else {
-      final byte[] tmpArray = getByteArray(estimateMaxBytes);
-      int written = StringEncodingUtils.convertUTF16ToUTF8(bytes, tmpArray, 0);
       writerIndex += buffer._unsafePutVarUint36Small(writerIndex, header);
+      long offHeapAddress = buffer.getUnsafeAddress();
+      int written = StringEncodingUtils.convertUTF16ToUTF8(bytes, offHeapAddress + writerIndex + 4);
       buffer._unsafePutInt32(writerIndex, written);
-      writerIndex += 4;
-      buffer.put(writerIndex, tmpArray, 0, written);
-      buffer._unsafeWriterIndex(writerIndex + written);
+      buffer._unsafeWriterIndex(writerIndex + 4 + written);
     }
+  }
+
+  public void writeUTF16BytesLatin1(MemoryBuffer buffer, byte[] bytes) {
+    int writerIndex = buffer.writerIndex();
+    int numBytes = bytes.length >> 1;
+    long header = ((long) numBytes << 2) | LATIN1;
+    buffer.ensure(writerIndex + 5 + numBytes);
+    byte[] targetArray = buffer.getHeapMemory();
+    if (targetArray != null) {
+      final int targetIndex = buffer._unsafeHeapWriterIndex();
+      int arrIndex = targetIndex;
+      arrIndex += LittleEndian.putVarUint36Small(targetArray, arrIndex, header);
+      writerIndex += arrIndex - targetIndex;
+      if (Platform.IS_LITTLE_ENDIAN) {
+        for (int i = 0; i < numBytes; i++) {
+          targetArray[arrIndex + i] = bytes[i * 2];
+        }
+      } else {
+        for (int i = 0; i < numBytes; i++) {
+          targetArray[arrIndex + i] = bytes[i * 2 + 1];
+        }
+      }
+    } else {
+      writerIndex += buffer._unsafePutVarUint36Small(writerIndex, header);
+      long address = buffer.getUnsafeAddress() + writerIndex;
+      if (Platform.IS_LITTLE_ENDIAN) {
+        for (int i = 0; i < numBytes; i++) {
+          Platform.UNSAFE.putByte(null, address + i, bytes[i * 2]);
+        }
+      } else {
+        for (int i = 0; i < numBytes; i++) {
+          Platform.UNSAFE.putByte(null, address + i, bytes[i * 2 + 1]);
+        }
+      }
+    }
+    writerIndex += numBytes;
+    buffer._unsafeWriterIndex(writerIndex);
   }
 
   private static final MethodHandles.Lookup STRING_LOOK_UP =
@@ -957,22 +952,6 @@ public final class StringSerializer extends ImmutableSerializer<String> {
     }
   }
 
-  private char[] getCharArray(int numElements) {
-    char[] charArray = this.charArray;
-    if (charArray.length < numElements) {
-      charArray = new char[numElements];
-      this.charArray = charArray;
-    }
-    if (charArray.length > DEFAULT_BUFFER_SIZE) {
-      smoothCharArrayLength =
-          Math.max(((int) (smoothCharArrayLength * 0.9 + numElements * 0.1)), DEFAULT_BUFFER_SIZE);
-      if (smoothByteArrayLength <= DEFAULT_BUFFER_SIZE) {
-        this.charArray = new char[DEFAULT_BUFFER_SIZE];
-      }
-    }
-    return charArray;
-  }
-
   private byte[] getByteArray(int numElements) {
     byte[] byteArray = this.byteArray;
     if (byteArray.length < numElements) {
@@ -987,21 +966,5 @@ public final class StringSerializer extends ImmutableSerializer<String> {
       }
     }
     return byteArray;
-  }
-
-  private byte[] getByteArray2(int numElements) {
-    byte[] byteArray2 = this.byteArray2;
-    if (byteArray2.length < numElements) {
-      byteArray2 = new byte[numElements];
-      this.byteArray = byteArray2;
-    }
-    if (byteArray2.length > DEFAULT_BUFFER_SIZE) {
-      smoothByteArrayLength =
-          Math.max(((int) (smoothByteArrayLength * 0.9 + numElements * 0.1)), DEFAULT_BUFFER_SIZE);
-      if (smoothByteArrayLength <= DEFAULT_BUFFER_SIZE) {
-        this.byteArray2 = new byte[DEFAULT_BUFFER_SIZE];
-      }
-    }
-    return byteArray2;
   }
 }

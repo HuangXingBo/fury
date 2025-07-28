@@ -19,6 +19,7 @@
 
 package org.apache.fory.util;
 
+import static org.apache.fory.memory.Platform.UNSAFE;
 import static org.apache.fory.util.StringUtils.MULTI_CHARS_NON_ASCII_MASK;
 
 import org.apache.fory.memory.Platform;
@@ -65,6 +66,49 @@ public class StringEncodingUtils {
     return dp;
   }
 
+  /** A fast convert algorithm to convert an utf16 char array into an utf8 off-heap array. */
+  public static int convertUTF16ToUTF8(char[] src, long dst) {
+    long before = dst;
+    int numChars = src.length;
+    for (int charOffset = 0, arrayOffset = Platform.CHAR_ARRAY_OFFSET; charOffset < numChars; ) {
+      if (charOffset + 4 <= numChars
+          && (Platform.getLong(src, arrayOffset) & MULTI_CHARS_NON_ASCII_MASK) == 0) {
+        // ascii only
+        Platform.UNSAFE.putByte(null, dst, (byte) src[charOffset]);
+        Platform.UNSAFE.putByte(null, dst + 1, (byte) src[charOffset + 1]);
+        Platform.UNSAFE.putByte(null, dst + 2, (byte) src[charOffset + 2]);
+        Platform.UNSAFE.putByte(null, dst + 3, (byte) src[charOffset + 3]);
+        dst += 4;
+        charOffset += 4;
+        arrayOffset += 8;
+      } else {
+        char c = src[charOffset++];
+        arrayOffset += 2;
+        if (c < 0x80) {
+          Platform.UNSAFE.putByte(null, dst++, (byte) c);
+        } else if (c < 0x800) {
+          Platform.UNSAFE.putByte(null, dst, (byte) (0xc0 | (c >> 6)));
+          Platform.UNSAFE.putByte(null, dst + 1, (byte) (0x80 | (c & 0x3f)));
+          dst += 2;
+        } else if (c >= '\uD800' && c <= Character.MAX_LOW_SURROGATE) {
+          if (utf8ToChar2(src, charOffset, c, dst)) {
+            dst += 4;
+            charOffset++;
+            arrayOffset += 2;
+          } else {
+            dst++;
+          }
+        } else {
+          Platform.UNSAFE.putByte(null, dst, (byte) (0xe0 | ((c >> 12))));
+          Platform.UNSAFE.putByte(null, dst + 1, (byte) (0x80 | ((c >> 6) & 0x3f)));
+          Platform.UNSAFE.putByte(null, dst + 2, (byte) (0x80 | (c & 0x3f)));
+          dst += 3;
+        }
+      }
+    }
+    return (int) (dst - before);
+  }
+
   /** A fast convert algorithm to convert an utf16 byte array into an utf8 byte array. */
   public static int convertUTF16ToUTF8(byte[] src, byte[] dst, int dp) {
     int numBytes = src.length;
@@ -100,9 +144,12 @@ public class StringEncodingUtils {
             dst[dp + 1] = (byte) (0x80 | (c & 0x3f));
             dp += 2;
           } else if (c >= '\uD800' && c <= Character.MAX_LOW_SURROGATE) {
-            utf8ToChar2(src, offset, c, numBytes, dst, dp);
-            dp += 4;
-            offset += 2;
+            if (utf8ToChar2(src, offset, c, numBytes, dst, dp)) {
+              dp += 4;
+              offset += 2;
+            } else {
+              dp++;
+            }
           } else {
             // 3 bytes, 16 bits
             dst[dp] = (byte) (0xe0 | ((c >> 12)));
@@ -116,6 +163,61 @@ public class StringEncodingUtils {
     return dp;
   }
 
+  /** A fast convert algorithm to convert an utf16 byte array into an utf8 byte array. */
+  public static int convertUTF16ToUTF8(byte[] src, long dst) {
+    long before = dst;
+    int numBytes = src.length;
+    for (int offset = 0; offset < numBytes; ) {
+      if (offset + 8 <= numBytes
+          && (Platform.getLong(src, Platform.BYTE_ARRAY_OFFSET + offset)
+                  & MULTI_CHARS_NON_ASCII_MASK)
+              == 0) {
+        // ascii only
+        if (Platform.IS_LITTLE_ENDIAN) {
+          Platform.UNSAFE.putByte(null, dst, src[offset]);
+          Platform.UNSAFE.putByte(null, dst + 1, src[offset + 2]);
+          Platform.UNSAFE.putByte(null, dst + 2, src[offset + 4]);
+          Platform.UNSAFE.putByte(null, dst + 3, src[offset + 6]);
+        } else {
+          Platform.UNSAFE.putByte(null, dst, src[offset + 1]);
+          Platform.UNSAFE.putByte(null, dst + 1, src[offset + 3]);
+          Platform.UNSAFE.putByte(null, dst + 2, src[offset + 5]);
+          Platform.UNSAFE.putByte(null, dst + 3, src[offset + 7]);
+        }
+        dst += 4;
+        offset += 8;
+      } else {
+        char c = Platform.getChar(src, Platform.BYTE_ARRAY_OFFSET + offset);
+        offset += 2;
+
+        if (c < 0x80) {
+          Platform.UNSAFE.putByte(null, dst++, (byte) c);
+        } else {
+          if (c < 0x800) {
+            // 2 bytes, 11 bits
+            Platform.UNSAFE.putByte(null, dst, (byte) (0xc0 | (c >> 6)));
+            Platform.UNSAFE.putByte(null, dst + 1, (byte) (0x80 | (c & 0x3f)));
+            dst += 2;
+          } else if (c >= '\uD800' && c <= Character.MAX_LOW_SURROGATE) {
+            if (utf8ToChar2(src, offset, c, numBytes, dst)) {
+              dst += 4;
+              offset += 2;
+            } else {
+              dst++;
+            }
+          } else {
+            // 3 bytes, 16 bits
+            Platform.UNSAFE.putByte(null, dst, (byte) (0xe0 | ((c >> 12))));
+            Platform.UNSAFE.putByte(null, dst + 1, (byte) (0x80 | ((c >> 6) & 0x3f)));
+            Platform.UNSAFE.putByte(null, dst + 2, (byte) (0x80 | (c & 0x3f)));
+            dst += 3;
+          }
+        }
+      }
+    }
+    return (int) (dst - before);
+  }
+
   /**
    * A fast convert algorithm to convert an utf8 encoded byte array into an utf16 encoded byte
    * array.
@@ -123,6 +225,7 @@ public class StringEncodingUtils {
   public static int convertUTF8ToUTF16(byte[] src, int offset, int len, byte[] dst) {
     final int end = offset + len;
     int dp = 0;
+    Platform.setMemory(dst, Platform.BYTE_ARRAY_OFFSET, dst.length, (byte) 0);
 
     while (offset < end) {
       if (offset + 8 <= end
@@ -344,6 +447,232 @@ public class StringEncodingUtils {
     return dp;
   }
 
+  /**
+   * A fast convert algorithm to convert an utf8 encoded off-heap byte array into an utf16 encoded
+   * byte array.
+   */
+  public static int convertUTF8ToUTF16(long src, byte[] dst, int len) {
+    final long end = src + len;
+    int dp = 0;
+    Platform.setMemory(dst, Platform.BYTE_ARRAY_OFFSET, dst.length, (byte) 0);
+
+    while (src < end) {
+      if (src + 8 <= end && (Platform.getLong(null, src) & 0x8080808080808080L) == 0) {
+        // ascii only
+        if (Platform.IS_LITTLE_ENDIAN) {
+          dst[dp] = UNSAFE.getByte(null, src);
+          dst[dp + 2] = UNSAFE.getByte(null, src + 1);
+          dst[dp + 4] = UNSAFE.getByte(null, src + 2);
+          dst[dp + 6] = UNSAFE.getByte(null, src + 3);
+          dst[dp + 8] = UNSAFE.getByte(null, src + 4);
+          dst[dp + 10] = UNSAFE.getByte(null, src + 5);
+          dst[dp + 12] = UNSAFE.getByte(null, src + 6);
+          dst[dp + 14] = UNSAFE.getByte(null, src + 7);
+        } else {
+          dst[dp + 1] = UNSAFE.getByte(null, src);
+          dst[dp + 3] = UNSAFE.getByte(null, src + 1);
+          dst[dp + 5] = UNSAFE.getByte(null, src + 2);
+          dst[dp + 7] = UNSAFE.getByte(null, src + 3);
+          dst[dp + 9] = UNSAFE.getByte(null, src + 4);
+          dst[dp + 11] = UNSAFE.getByte(null, src + 5);
+          dst[dp + 13] = UNSAFE.getByte(null, src + 6);
+          dst[dp + 15] = UNSAFE.getByte(null, src + 7);
+        }
+        dp += 16;
+        src += 8;
+      } else {
+        int b0 = UNSAFE.getByte(null, src++);
+        if (b0 >= 0) {
+          // 1 byte, 7 bits: 0xxxxxxx
+          dst[dp] = (byte) b0;
+          dst[dp + 1] = 0;
+          dp += 2;
+        } else if ((b0 >> 5) == -2 && (b0 & 0x1e) != 0) {
+          // 2 bytes, 11 bits: 110xxxxx 10xxxxxx
+          if (src >= end) {
+            return -1;
+          }
+          int b1 = UNSAFE.getByte(null, src++);
+          if ((b1 & 0xc0) != 0x80) { // isNotContinuation(b2)
+            return -1;
+          } else {
+            char c = (char) (((b0 << 6) ^ b1) ^ (((byte) 0xC0 << 6) ^ ((byte) 0x80)));
+            dst[dp] = (byte) c;
+            dst[dp + 1] = (byte) (c >> 8);
+            dp += 2;
+          }
+        } else if ((b0 >> 4) == -2) {
+          // 3 bytes, 16 bits: 1110xxxx 10xxxxxx 10xxxxxx
+          if (src + 1 >= end) {
+            return -1;
+          }
+          int b1 = UNSAFE.getByte(null, src);
+          int b2 = UNSAFE.getByte(null, src + 1);
+          src += 2;
+          if ((b0 == (byte) 0xe0 && (b1 & 0xe0) == 0x80) //
+              || (b1 & 0xc0) != 0x80 //
+              || (b2 & 0xc0) != 0x80) { // isMalformed3(b0, b1, b2)
+            return -1;
+          } else {
+            char c =
+                (char)
+                    ((b0 << 12)
+                        ^ (b1 << 6)
+                        ^ (b2 ^ (((byte) 0xE0 << 12) ^ ((byte) 0x80 << 6) ^ ((byte) 0x80))));
+            boolean isSurrogate = c >= '\uD800' && c < (Character.MAX_LOW_SURROGATE + 1);
+            if (isSurrogate) {
+              return -1;
+            } else {
+              dst[dp] = (byte) c;
+              dst[dp + 1] = (byte) (c >> 8);
+              dp += 2;
+            }
+          }
+        } else if ((b0 >> 3) == -2) {
+          // 4 bytes, 21 bits: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+          if (src + 2 >= end) {
+            return -1;
+          }
+          int b2 = UNSAFE.getByte(null, src);
+          int b3 = UNSAFE.getByte(null, src + 1);
+          int b4 = UNSAFE.getByte(null, src + 2);
+          src += 3;
+          int uc =
+              ((b0 << 18)
+                  ^ (b2 << 12)
+                  ^ (b3 << 6)
+                  ^ (b4
+                      ^ (((byte) 0xF0 << 18)
+                          ^ ((byte) 0x80 << 12)
+                          ^ ((byte) 0x80 << 6)
+                          ^ ((byte) 0x80))));
+          if (((b2 & 0xc0) != 0x80 || (b3 & 0xc0) != 0x80 || (b4 & 0xc0) != 0x80) // isMalformed4
+              ||
+              // shortest form check
+              !(uc >= 0x010000 && uc < 0X10FFFF + 1) // !Character.isSupplementaryCodePoint(uc)
+          ) {
+            return -1;
+          } else {
+            char c = (char) ((uc >>> 10) + ('\uD800' - (0x010000 >>> 10)));
+            dst[dp] = (byte) c;
+            dst[dp + 1] = (byte) (c >> 8);
+            dp += 2;
+
+            c = (char) ((uc & 0x3ff) + Character.MIN_LOW_SURROGATE);
+            dst[dp] = (byte) c;
+            dst[dp + 1] = (byte) (c >> 8);
+            dp += 2;
+          }
+        } else {
+          return -1;
+        }
+      }
+    }
+    return dp;
+  }
+
+  /**
+   * A fast convert algorithm to convert an utf8 encoded off-heap byte array into an utf16 encoded
+   * char array.
+   */
+  public static int convertUTF8ToUTF16(long src, char[] dst, int len) {
+    long end = src + len;
+    int dp = 0;
+    while (src < end) {
+      if (src + 8 <= end && (Platform.getLong(null, src) & 0x8080808080808080L) == 0) {
+        // ascii only
+        dst[dp] = (char) UNSAFE.getByte(null, src);
+        dst[dp + 1] = (char) UNSAFE.getByte(null, src + 1);
+        dst[dp + 2] = (char) UNSAFE.getByte(null, src + 2);
+        dst[dp + 3] = (char) UNSAFE.getByte(null, src + 3);
+        dst[dp + 4] = (char) UNSAFE.getByte(null, src + 4);
+        dst[dp + 5] = (char) UNSAFE.getByte(null, src + 5);
+        dst[dp + 6] = (char) UNSAFE.getByte(null, src + 6);
+        dst[dp + 7] = (char) UNSAFE.getByte(null, src + 7);
+        dp += 8;
+        src += 8;
+      } else {
+        int b1 = UNSAFE.getByte(null, src++);
+        if (b1 >= 0) {
+          // 1 byte, 7 bits: 0xxxxxxx
+          dst[dp++] = (char) b1;
+        } else if ((b1 >> 5) == -2 && (b1 & 0x1e) != 0) {
+          // 2 bytes, 11 bits: 110xxxxx 10xxxxxx
+          if (src >= end) {
+            return -1;
+          }
+          int b2 = UNSAFE.getByte(null, src++);
+          if ((b2 & 0xc0) != 0x80) { // isNotContinuation(b2)
+            return -1;
+          } else {
+            dst[dp++] = (char) (((b1 << 6) ^ b2) ^ (((byte) 0xC0 << 6) ^ ((byte) 0x80)));
+          }
+        } else if ((b1 >> 4) == -2) {
+          // 3 bytes, 16 bits: 1110xxxx 10xxxxxx 10xxxxxx
+          if (src + 1 >= end) {
+            return -1;
+          }
+
+          int b2 = UNSAFE.getByte(null, src);
+          int b3 = UNSAFE.getByte(null, src + 1);
+          src += 2;
+          if ((b1 == (byte) 0xe0 && (b2 & 0xe0) == 0x80) //
+              || (b2 & 0xc0) != 0x80 //
+              || (b3 & 0xc0) != 0x80) { // isMalformed3(b1, b2, b3)
+            return -1;
+          } else {
+            char c =
+                (char)
+                    ((b1 << 12)
+                        ^ (b2 << 6)
+                        ^ (b3 ^ (((byte) 0xE0 << 12) ^ ((byte) 0x80 << 6) ^ ((byte) 0x80))));
+            boolean isSurrogate = c >= '\uD800' && c < (Character.MAX_LOW_SURROGATE + 1);
+            if (isSurrogate) {
+              return -1;
+            } else {
+              dst[dp++] = c;
+            }
+          }
+        } else if ((b1 >> 3) == -2) {
+          // 4 bytes, 21 bits: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+          if (src + 2 >= end) {
+            return -1;
+          }
+          int b2 = UNSAFE.getByte(null, src);
+          int b3 = UNSAFE.getByte(null, src + 1);
+          int b4 = UNSAFE.getByte(null, src + 2);
+          src += 3;
+          int uc =
+              ((b1 << 18)
+                  ^ (b2 << 12)
+                  ^ (b3 << 6)
+                  ^ (b4
+                      ^ (((byte) 0xF0 << 18)
+                          ^ ((byte) 0x80 << 12)
+                          ^ ((byte) 0x80 << 6)
+                          ^ ((byte) 0x80))));
+          if (((b2 & 0xc0) != 0x80 || (b3 & 0xc0) != 0x80 || (b4 & 0xc0) != 0x80) // isMalformed4
+              ||
+              // shortest form check
+              !(uc >= 0x010000 && uc < 0X10FFFF + 1) // !Character.isSupplementaryCodePoint(uc)
+          ) {
+            return -1;
+          } else {
+            dst[dp] =
+                (char)
+                    ((uc >>> 10) + ('\uD800' - (0x010000 >>> 10))); // Character.highSurrogate(uc);
+            dst[dp + 1] =
+                (char) ((uc & 0x3ff) + Character.MIN_LOW_SURROGATE); // Character.lowSurrogate(uc);
+            dp += 2;
+          }
+        } else {
+          return -1;
+        }
+      }
+    }
+    return dp;
+  }
+
   /** convert two utf16 char c and src[charOffset] to a four byte utf8 bytes. */
   private static void utf8ToChar2(char[] src, int charOffset, char c, byte[] dst, int dp) {
     char d;
@@ -361,8 +690,28 @@ public class StringEncodingUtils {
     dst[dp + 3] = (byte) (0x80 | (uc & 0x3f));
   }
 
+  /** convert two utf16 char c and src[charOffset] to a four byte utf8 bytes. */
+  private static boolean utf8ToChar2(char[] src, int charOffset, char c, long dst) {
+    char d;
+    if (c > Character.MAX_HIGH_SURROGATE
+        || charOffset == src.length
+        || (d = src[charOffset]) < Character.MIN_LOW_SURROGATE
+        || d > Character.MAX_LOW_SURROGATE) {
+      // repl = 63 in JDK8.
+      Platform.UNSAFE.putByte(null, dst, (byte) (63));
+      return false;
+    } else {
+      int uc = ((c << 10) + d) + (0x010000 - ('\uD800' << 10) - Character.MIN_LOW_SURROGATE);
+      Platform.UNSAFE.putByte(null, dst, (byte) (0xf0 | ((uc >> 18))));
+      Platform.UNSAFE.putByte(null, dst + 1, (byte) (0x80 | ((uc >> 12) & 0x3f)));
+      Platform.UNSAFE.putByte(null, dst + 2, (byte) (0x80 | ((uc >> 6) & 0x3f)));
+      Platform.UNSAFE.putByte(null, dst + 3, (byte) (0x80 | (uc & 0x3f)));
+      return true;
+    }
+  }
+
   /** convert two utf16 char c and char(src[offset], src[offset+1]) to a four byte utf8 bytes. */
-  private static void utf8ToChar2(
+  private static boolean utf8ToChar2(
       byte[] src, int offset, char c, int numBytes, byte[] dst, int dp) {
     char d;
     if (c > Character.MAX_HIGH_SURROGATE
@@ -370,13 +719,37 @@ public class StringEncodingUtils {
         || (d = Platform.getChar(src, Platform.BYTE_ARRAY_OFFSET + offset))
             < Character.MIN_LOW_SURROGATE
         || d > Character.MAX_LOW_SURROGATE) {
-      throw new RuntimeException("malformed input off : " + offset);
+      // repl = 63 in JDK8.
+      dst[dp] = 63;
+      return false;
+    } else {
+      int uc = ((c << 10) + d) + (0x010000 - ('\uD800' << 10) - Character.MIN_LOW_SURROGATE);
+      dst[dp] = (byte) (0xf0 | ((uc >> 18)));
+      dst[dp + 1] = (byte) (0x80 | ((uc >> 12) & 0x3f));
+      dst[dp + 2] = (byte) (0x80 | ((uc >> 6) & 0x3f));
+      dst[dp + 3] = (byte) (0x80 | (uc & 0x3f));
+      return true;
     }
+  }
 
-    int uc = ((c << 10) + d) + (0x010000 - ('\uD800' << 10) - Character.MIN_LOW_SURROGATE);
-    dst[dp] = (byte) (0xf0 | ((uc >> 18)));
-    dst[dp + 1] = (byte) (0x80 | ((uc >> 12) & 0x3f));
-    dst[dp + 2] = (byte) (0x80 | ((uc >> 6) & 0x3f));
-    dst[dp + 3] = (byte) (0x80 | (uc & 0x3f));
+  /** convert two utf16 char c and char(src[offset], src[offset+1]) to a four byte utf8 bytes. */
+  private static boolean utf8ToChar2(byte[] src, int offset, char c, int numBytes, long dst) {
+    char d;
+    if (c > Character.MAX_HIGH_SURROGATE
+        || numBytes - offset < 1
+        || (d = Platform.getChar(src, Platform.BYTE_ARRAY_OFFSET + offset))
+            < Character.MIN_LOW_SURROGATE
+        || d > Character.MAX_LOW_SURROGATE) {
+      // repl = 63 in JDK8.
+      Platform.UNSAFE.putByte(null, dst, (byte) 63);
+      return false;
+    } else {
+      int uc = ((c << 10) + d) + (0x010000 - ('\uD800' << 10) - Character.MIN_LOW_SURROGATE);
+      Platform.UNSAFE.putByte(null, dst, (byte) (0xf0 | ((uc >> 18))));
+      Platform.UNSAFE.putByte(null, dst + 1, (byte) (0x80 | ((uc >> 12) & 0x3f)));
+      Platform.UNSAFE.putByte(null, dst + 2, (byte) (0x80 | ((uc >> 6) & 0x3f)));
+      Platform.UNSAFE.putByte(null, dst + 3, (byte) (0x80 | (uc & 0x3f)));
+      return true;
+    }
   }
 }

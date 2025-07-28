@@ -270,6 +270,26 @@ public class StringUtils {
     return builder.toString();
   }
 
+  public static boolean isLatin(byte[] bytes) {
+    int numBytes = bytes.length;
+    int vectorizedLen = numBytes >> 3;
+    int vectorizedBytes = vectorizedLen << 3;
+    int endOffset = Platform.BYTE_ARRAY_OFFSET + vectorizedBytes;
+    for (int offset = Platform.BYTE_ARRAY_OFFSET; offset < endOffset; offset += 8) {
+      long multiChars = Platform.getLong(bytes, offset);
+      if ((multiChars & MULTI_CHARS_NON_LATIN_MASK) != 0) {
+        return false;
+      }
+    }
+    for (int i = vectorizedBytes; vectorizedBytes < numBytes; vectorizedBytes += 2) {
+      if (Platform.getChar(bytes, Platform.BYTE_ARRAY_OFFSET + i) > 0xFF) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   public static boolean isLatin(char[] chars) {
     return isLatin(chars, 0);
   }
